@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push: {branches: [main]}
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: relay
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 3s --health-retries 10
+
+    env:
+      RELAY_REDIS_URL: redis://localhost:6379/0
+      RELAY_DATABASE_URL: postgresql+asyncpg://relay:relay@localhost:5432/relay
+      PYTHONPATH: .
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check apps packages tests
+
+      - name: Create schema
+        run: python scripts/init_db.py
+
+      - name: Unit tests
+        run: pytest tests/unit -q
+
+      - name: Reliability tests (Redis)
+        run: pytest tests/reliability -q
+
+      - name: Start gateway nodes and control plane
+        run: |
+          uvicorn apps.control_plane.main:app --port 8001 &
+          RELAY_NODE_ID=relay-node-a uvicorn apps.gateway.main:app --port 8000 &
+          RELAY_NODE_ID=relay-node-b uvicorn apps.gateway.main:app --port 8010 &
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:8000/health/ready && \
+            curl -fsS http://localhost:8010/health/ready && break
+            sleep 1
+          done
+
+      - name: End-to-end protocol tests
+        run: python tests/integration/e2e_verify.py
+
+      - name: Presence tests
+        run: python tests/integration/presence_verify.py
+
+      - name: Distributed multi-node tests
+        run: python tests/distributed/multinode_verify.py

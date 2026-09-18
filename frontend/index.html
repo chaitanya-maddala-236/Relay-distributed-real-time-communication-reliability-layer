@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Relay — Reliability Console</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #262d36; --text: #e6edf3;
+    --dim: #8b949e; --accent: #3fb950; --warn: #d29922; --bad: #f85149;
+    --info: #58a6ff; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, sans-serif;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .04em; }
+  header .sub { color: var(--dim); font-size: 12px; }
+  .grid { display: grid; grid-template-columns: 320px 1fr 300px; gap: 1px; background: var(--line); }
+  @media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); padding: 16px; min-height: 0; }
+  .panel h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--dim); margin: 0 0 12px;
+  }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; font-size: 13px; }
+  .row span:last-child { font-family: var(--mono); font-size: 12px; color: var(--dim); text-align: right;
+    overflow-wrap: anywhere; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .connected { background: var(--accent); } .reconnecting { background: var(--warn); }
+  .closed { background: var(--bad); } .connecting { background: var(--info); }
+  input, button, select {
+    font: inherit; background: #0d1117; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px;
+  }
+  input { width: 100%; font-family: var(--mono); font-size: 12px; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--dim); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; }
+  button.danger { background: #3d1518; border-color: #6e2529; }
+  .field { margin-bottom: 10px; }
+  .field label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 4px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 6px; }
+  #log { height: 46vh; overflow-y: auto; font-family: var(--mono); font-size: 12px; }
+  .msg { padding: 5px 8px; border-left: 2px solid var(--line); margin-bottom: 3px; }
+  .msg.dup { border-left-color: var(--warn); color: var(--warn); }
+  .msg.gap { border-left-color: var(--bad); color: var(--bad); }
+  .msg.sys { border-left-color: var(--info); color: var(--info); }
+  .msg .seq { color: var(--dim); margin-right: 8px; }
+  .stat { font-size: 22px; font-family: var(--mono); }
+  .stat.warn { color: var(--warn); } .stat.bad { color: var(--bad); }
+  .note { font-size: 11px; color: var(--dim); margin-top: 12px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<header>
+  <h1>RELAY</h1>
+  <span class="sub">reliability console &mdash; at-least-once delivery, channel-level ordering, session resume</span>
+</header>
+
+<div class="grid">
+  <!-- Connection -->
+  <div class="panel">
+    <h2>Connection</h2>
+    <div class="field">
+      <label>Gateway WebSocket URL</label>
+      <input id="url" value="ws://localhost:8000/ws">
+    </div>
+    <div class="field">
+      <label>API key (from `make seed`)</label>
+      <input id="token" placeholder="relay_...">
+    </div>
+    <div class="field">
+      <label>Channel</label>
+      <input id="channel" placeholder="t-&lt;tenant_id&gt;:room-engineering">
+    </div>
+    <div class="controls">
+      <button class="primary" id="btnConnect">Connect</button>
+      <button id="btnSubscribe" disabled>Subscribe</button>
+      <button class="danger" id="btnDisconnect" disabled>Disconnect</button>
+    </div>
+
+    <h2 style="margin-top:22px">State</h2>
+    <div class="row"><span><span class="dot closed" id="dot"></span><b id="state">closed</b></span><span id="node">—</span></div>
+    <div class="row"><span>Session</span><span id="session">—</span></div>
+    <div class="row"><span>Connection</span><span id="conn">—</span></div>
+    <div class="row"><span>Last heartbeat</span><span id="hb">—</span></div>
+    <div class="row"><span>Acked sequence</span><span id="acked">—</span></div>
+
+    <h2 style="margin-top:22px">Reliability controls</h2>
+    <div class="controls">
+      <button id="btnPause">Pause consumption</button>
+      <button id="btnDrop" disabled>Drop connection</button>
+    </div>
+    <p class="note">
+      <b>Pause consumption</b> stops acknowledging. The server's in-flight
+      window fills, delivery to this client stops, and if the burst
+      continues the server disconnects it with SLOW_CONSUMER — while other
+      clients are unaffected.<br><br>
+      <b>Drop connection</b> kills the socket without closing the session,
+      so reconnecting replays what was missed via RESUME.
+    </p>
+  </div>
+
+  <!-- Messages -->
+  <div class="panel">
+    <h2>Messages</h2>
+    <div id="log"></div>
+    <div class="field" style="margin-top:12px">
+      <label>Publish via HTTP API (needs the control-plane API key)</label>
+      <div style="display:flex; gap:6px">
+        <input id="text" placeholder="message text" style="flex:1">
+        <button id="btnSend" disabled>Publish</button>
+      </div>
+    </div>
+    <p class="note">
+      Messages are published through <code>POST /v1/publish</code>, which
+      assigns the sequence number server-side, so ordering holds no matter
+      which node or publisher a message came from.
+    </p>
+  </div>
+
+  <!-- Stats -->
+  <div class="panel">
+    <h2>Reliability counters</h2>
+    <div class="row"><span>Received</span><span class="stat" id="sReceived">0</span></div>
+    <div class="row"><span>Duplicates suppressed</span><span class="stat warn" id="sDup">0</span></div>
+    <div class="row"><span>Gaps detected</span><span class="stat bad" id="sGap">0</span></div>
+    <div class="row"><span>Reconnects</span><span class="stat" id="sReconn">0</span></div>
+    <div class="row"><span>Resumes</span><span class="stat" id="sResume">0</span></div>
+    <p class="note">
+      Delivery is <b>at-least-once</b>. Duplicates are expected under
+      retry; this client suppresses them by <code>message_id</code> within
+      a bounded window. A gap means a sequence number was skipped — the
+      client surfaces it instead of silently continuing.
+    </p>
+  </div>
+</div>
+
+<script>
+// Inline JS port of client/src/RelayClient.ts — kept dependency-free so
+// the console can be opened as a plain file against any gateway.
+class RelayClient {
+  constructor(opts) {
+    this.opts = Object.assign({ baseDelayMs: 250, maxDelayMs: 30000, dedupWindowSize: 5000 }, opts);
+    this.ws = null; this.sessionId = null; this.connectionId = null; this.nodeId = null;
+    this.subscriptions = new Set(); this.lastAck = new Map(); this.lastSeen = new Map();
+    this.seenIds = new Set(); this.seenOrder = []; this.attempt = 0;
+    this.paused = false; this.closedByUser = false;
+    this.stats = { messagesReceived: 0, duplicatesSuppressed: 0, gapsDetected: 0, reconnects: 0, resumes: 0 };
+  }
+  connect() {
+    this.closedByUser = false;
+    this.setState(this.sessionId ? 'reconnecting' : 'connecting');
+    const ws = new WebSocket(this.opts.url); this.ws = ws;
+    ws.onopen = () => ws.send(JSON.stringify({ type: 'CONNECT', token: this.opts.token, session_id: this.sessionId }));
+    ws.onmessage = e => this.handleFrame(JSON.parse(e.data));
+    ws.onclose = () => { this.ws = null; this.closedByUser ? this.setState('closed') : this.scheduleReconnect(); };
+  }
+  disconnect() { this.closedByUser = true; clearTimeout(this.timer); this.ws && this.ws.close(); this.setState('closed'); }
+  dropSocket() { this.ws && this.ws.close(); }   // keeps the session for RESUME
+  scheduleReconnect() {
+    this.setState('reconnecting');
+    const exp = Math.min(this.opts.baseDelayMs * 2 ** this.attempt, this.opts.maxDelayMs);
+    const delay = Math.random() * exp;           // full jitter (Section 57)
+    this.attempt++; this.stats.reconnects++; this.opts.onStats && this.opts.onStats(this.stats);
+    this.opts.onLog && this.opts.onLog('sys', `reconnecting in ${Math.round(delay)}ms (attempt ${this.attempt})`);
+    this.timer = setTimeout(() => this.connect(), delay);
+  }
+  handleFrame(f) {
+    switch (f.type) {
+      case 'CONNECTED': return this.onConnected(f);
+      case 'PING': this.send({ type: 'PONG' }); this.opts.onHeartbeat && this.opts.onHeartbeat(); return;
+      case 'MESSAGE': return this.onMessage(f);
+      case 'RESUMED':
+        this.stats.resumes++; this.opts.onStats && this.opts.onStats(this.stats);
+        this.opts.onLog && this.opts.onLog('sys',
+          `RESUMED — replayed ${JSON.stringify(f.replayed_by_channel)}${f.gaps.length ? ' gaps: ' + f.gaps.join(',') : ''}`);
+        return;
+      case 'SUBSCRIBED': this.opts.onLog && this.opts.onLog('sys', `SUBSCRIBED ${f.channel}`); return;
+      case 'DISCONNECT': this.opts.onLog && this.opts.onLog('gap', `server DISCONNECT: ${f.reason}`); return;
+      case 'ERROR':
+        if (f.code === 'RESUME_GAP' || f.code === 'RESUME_WINDOW_EXPIRED') { this.lastAck.clear(); this.lastSeen.clear(); }
+        this.opts.onLog && this.opts.onLog('gap', `ERROR ${f.code}: ${f.message || ''}`);
+        return;
+    }
+  }
+  onConnected(f) {
+    const resuming = this.sessionId === f.session_id && this.sessionId !== null;
+    this.sessionId = f.session_id; this.connectionId = f.connection_id; this.nodeId = f.node_id;
+    this.attempt = 0; this.setState('connected');
+    if (resuming && this.lastAck.size) {
+      this.send({ type: 'RESUME', session_id: this.sessionId, last_ack_by_channel: Object.fromEntries(this.lastAck) });
+      this.opts.onLog && this.opts.onLog('sys', `RESUME from ${JSON.stringify(Object.fromEntries(this.lastAck))}`);
+    }
+    for (const ch of this.subscriptions) this.send({ type: 'SUBSCRIBE', channel: ch });
+  }
+  onMessage(m) {
+    this.stats.messagesReceived++;
+    if (this.seenIds.has(m.message_id)) {
+      this.stats.duplicatesSuppressed++;
+      this.opts.onLog && this.opts.onLog('dup', `duplicate suppressed — ${m.message_id.slice(0, 8)}…`);
+      this.opts.onStats && this.opts.onStats(this.stats);
+      if (!this.paused) this.ack(m.channel, m.sequence);
+      return;
+    }
+    this.seenIds.add(m.message_id); this.seenOrder.push(m.message_id);
+    while (this.seenOrder.length > this.opts.dedupWindowSize) this.seenIds.delete(this.seenOrder.shift());
+
+    const prev = this.lastSeen.get(m.channel);
+    if (prev !== undefined && m.sequence > prev + 1) {
+      this.stats.gapsDetected++;
+      this.opts.onLog && this.opts.onLog('gap', `GAP — expected ${prev + 1}, received ${m.sequence}`);
+    }
+    if (prev === undefined || m.sequence > prev) this.lastSeen.set(m.channel, m.sequence);
+
+    this.opts.onLog && this.opts.onLog('', `${m.payload.text ?? JSON.stringify(m.payload)}`, m.sequence);
+    this.opts.onStats && this.opts.onStats(this.stats);
+    if (!this.paused) this.ack(m.channel, m.sequence);
+  }
+  subscribe(ch) { this.subscriptions.add(ch); this.send({ type: 'SUBSCRIBE', channel: ch }); }
+  ack(ch, seq) {
+    if (seq <= (this.lastAck.get(ch) ?? 0)) return;
+    this.lastAck.set(ch, seq); this.send({ type: 'ACK', channel: ch, sequence: seq });
+    this.opts.onAck && this.opts.onAck(seq);
+  }
+  send(f) { this.ws && this.ws.readyState === 1 && this.ws.send(JSON.stringify(f)); }
+  setState(s) { this.state = s; this.opts.onStateChange && this.opts.onStateChange(s); }
+}
+
+const $ = id => document.getElementById(id);
+let client = null;
+
+function log(kind, text, seq) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + kind;
+  el.innerHTML = (seq !== undefined ? `<span class="seq">#${seq}</span>` : '') +
+                 text.replace(/</g, '&lt;');
+  $('log').appendChild(el);
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+function renderStats(s) {
+  $('sReceived').textContent = s.messagesReceived;
+  $('sDup').textContent = s.duplicatesSuppressed;
+  $('sGap').textContent = s.gapsDetected;
+  $('sReconn').textContent = s.reconnects;
+  $('sResume').textContent = s.resumes;
+}
+
+$('btnConnect').onclick = () => {
+  client = new RelayClient({
+    url: $('url').value,
+    token: $('token').value.trim(),
+    onLog: log,
+    onStats: renderStats,
+    onAck: seq => $('acked').textContent = seq,
+    onHeartbeat: () => $('hb').textContent = new Date().toLocaleTimeString(),
+    onStateChange: s => {
+      $('state').textContent = s;
+      $('dot').className = 'dot ' + s;
+      $('session').textContent = client.sessionId ? client.sessionId.slice(0, 13) + '…' : '—';
+      $('conn').textContent = client.connectionId ?? '—';
+      $('node').textContent = client.nodeId ?? '—';
+      const on = s === 'connected';
+      $('btnSubscribe').disabled = !on;
+      $('btnSend').disabled = !on;
+      $('btnDrop').disabled = !on;
+      $('btnDisconnect').disabled = s === 'closed';
+    },
+  });
+  client.connect();
+};
+
+$('btnSubscribe').onclick = () => client.subscribe($('channel').value.trim());
+$('btnDisconnect').onclick = () => client.disconnect();
+$('btnDrop').onclick = () => { log('sys', 'dropping socket (session preserved)'); client.dropSocket(); };
+
+$('btnPause').onclick = () => {
+  client.paused = !client.paused;
+  $('btnPause').textContent = client.paused ? 'Resume consumption' : 'Pause consumption';
+  log('sys', client.paused
+    ? 'paused — no longer acknowledging; the server window will fill'
+    : 'resumed — acknowledging again');
+  if (!client.paused) {
+    for (const [ch, seq] of client.lastSeen) client.ack(ch, seq);
+  }
+};
+
+$('btnSend').onclick = async () => {
+  const httpBase = $('url').value.replace(/^ws/, 'http').replace(/\/ws$/, '');
+  await fetch(httpBase + '/v1/publish', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + $('token').value.trim() },
+    body: JSON.stringify({ channel: $('channel').value.trim(), payload: { text: $('text').value } }),
+  });
+  $('text').value = '';
+};
+</script>
+</body>
+</html>

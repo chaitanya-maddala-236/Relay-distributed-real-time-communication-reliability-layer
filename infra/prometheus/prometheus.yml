@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: relay-gateway
+    static_configs:
+      - targets: ["relay-node-1:8000", "relay-node-2:8000"]
+    metrics_path: /metrics

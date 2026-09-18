@@ -1,0 +1,26 @@
+[project]
+name = "relay"
+version = "0.1.0"
+description = "Distributed real-time communication reliability layer"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test helpers take a `timeout` kwarg by design; ASYNC109 prefers
+# asyncio.timeout() at the call site, which these helpers wrap.
+"tests/*" = ["ASYNC109"]
+# The chaos test deliberately stops and starts Redis with blocking
+# subprocess calls; that is the point of the test.
+"tests/chaos/*" = ["ASYNC109", "ASYNC221"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]

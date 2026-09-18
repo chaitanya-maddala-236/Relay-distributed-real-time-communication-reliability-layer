@@ -1,0 +1,104 @@
+# Local deployment that reproduces distributed behavior (Section 127).
+# Two gateway nodes behind Nginx, sharing one Redis and one Postgres, so
+# cross-node fanout and session portability are exercised by default
+# rather than only in production.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+      POSTGRES_DB: relay
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports: ["5432:5432"]
+
+  redis:
+    image: redis:7-alpine
+    # appendonly keeps sequence counters and recovery buffers across a
+    # restart. Without it, a Redis restart resets channel sequences —
+    # see docs/failure-model.md, which documents both behaviors.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports: ["6379:6379"]
+
+  migrate:
+    build: .
+    command: ["python", "scripts/init_db.py"]
+    environment:
+      RELAY_DATABASE_URL: postgresql+asyncpg://relay:relay@postgres:5432/relay
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  control-plane:
+    build: .
+    command: ["uvicorn", "apps.control_plane.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      RELAY_DATABASE_URL: postgresql+asyncpg://relay:relay@postgres:5432/relay
+      RELAY_REDIS_URL: redis://redis:6379/0
+    ports: ["8001:8001"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+  relay-node-1:
+    build: .
+    environment:
+      RELAY_NODE_ID: relay-node-1
+      RELAY_DATABASE_URL: postgresql+asyncpg://relay:relay@postgres:5432/relay
+      RELAY_REDIS_URL: redis://redis:6379/0
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+  relay-node-2:
+    build: .
+    environment:
+      RELAY_NODE_ID: relay-node-2
+      RELAY_DATABASE_URL: postgresql+asyncpg://relay:relay@postgres:5432/relay
+      RELAY_REDIS_URL: redis://redis:6379/0
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./frontend:/usr/share/nginx/html:ro
+    ports: ["8080:80"]
+    depends_on: [relay-node-1, relay-node-2]
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./infra/grafana:/etc/grafana/provisioning:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
